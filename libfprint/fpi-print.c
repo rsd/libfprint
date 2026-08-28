@@ -261,6 +261,27 @@ fpi_print_add_from_image (FpPrint *print,
   return TRUE;
 }
 
+static void
+fpi_print_score_log (const char *algo,
+                     gint        index,
+                     gint        score,
+                     gint        threshold)
+{
+  const char *path = g_getenv ("FP_PRINT_SCORE_LOG");
+  g_autofree gchar *line = NULL;
+  FILE *f;
+
+  if (!path)
+    return;
+
+  f = fopen (path, "a");
+  if (!f)
+    return;
+  line = g_strdup_printf ("%s %d %d %d\n", algo, index, score, threshold);
+  fputs (line, f);
+  fclose (f);
+}
+
 /**
  * fpi_print_bz3_match:
  * @print_template: A #FpPrint containing one or more prints
@@ -311,6 +332,7 @@ fpi_print_bz3_match (FpPrint *print_template,
       gstruct = g_ptr_array_index (print_template->prints, i);
       score = bozorth_to_gallery (probe_len, pstruct, gstruct);
       fp_dbg ("score %d/%d", score, score_threshold);
+      fpi_print_score_log ("nbis", i, score, score_threshold);
 
       if (score >= score_threshold)
         return FPI_MATCH_SUCCESS;
@@ -373,6 +395,7 @@ fpi_print_sigfm_match (FpPrint * template, FpPrint * print,
           return FPI_MATCH_ERROR;
         }
       fp_dbg ("sigfm score %d/%d", score, score_threshold);
+      fpi_print_score_log ("sigfm", i, score, score_threshold);
       if (score >= score_threshold)
         return FPI_MATCH_SUCCESS;
     }

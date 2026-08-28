@@ -18,6 +18,7 @@
  */
 
 #include <libfprint/fprint.h>
+#include <glib/gstdio.h>
 #include "fpi-print.h"
 #include "fp-print-private.h"
 #ifdef HAVE_SIGFM
@@ -240,6 +241,35 @@ test_sigfm_blob_roundtrip_and_magic (void)
 #endif
 }
 
+static void
+test_score_log_writes_lines (void)
+{
+  g_autofree gchar *path = NULL;
+  g_autofree gchar *contents = NULL;
+
+  g_autoptr(FpPrint) template = make_print (FPI_PRINT_NBIS);
+  g_autoptr(FpPrint) probe = make_print (FPI_PRINT_NBIS);
+  g_autoptr(GError) error = NULL;
+  gint fd;
+
+  fd = g_file_open_tmp ("score-log-XXXXXX", &path, NULL);
+  g_assert_cmpint (fd, >=, 0);
+  g_close (fd, NULL);
+  g_setenv ("FP_PRINT_SCORE_LOG", path, TRUE);
+
+  /* Empty xyt structs: bozorth scores 0, one comparison logged. */
+  g_ptr_array_add (template->prints, g_new0 (struct xyt_struct, 1));
+  g_ptr_array_add (probe->prints, g_new0 (struct xyt_struct, 1));
+
+  g_assert_cmpint (fpi_print_bz3_match (template, probe, 40, &error),
+                   ==, FPI_MATCH_FAIL);
+  g_unsetenv ("FP_PRINT_SCORE_LOG");
+
+  g_assert_true (g_file_get_contents (path, &contents, NULL, NULL));
+  g_assert_cmpstr (contents, ==, "nbis 0 0 40\n");
+  g_unlink (path);
+}
+
 int
 main (int argc, char *argv[])
 {
@@ -258,5 +288,7 @@ main (int argc, char *argv[])
                    test_sigfm_match_rejects_empty_probe);
   g_test_add_func ("/print/sigfm/blob_magic",
                    test_sigfm_blob_roundtrip_and_magic);
+  g_test_add_func ("/print/score_log/writes_lines",
+                   test_score_log_writes_lines);
   return g_test_run ();
 }

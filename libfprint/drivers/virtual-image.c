@@ -335,4 +335,51 @@ fpi_device_virtual_image_class_init (FpDeviceVirtualImageClass *klass)
       dev_class->temp_hot_seconds = hot_seconds_value;
       g_debug ("device hot seconds set to %d", dev_class->temp_hot_seconds);
     }
+
+  {
+    const char *algo = g_getenv ("FP_VIRTUAL_IMAGE_ALGORITHM");
+    const char *threshold = g_getenv ("FP_VIRTUAL_IMAGE_SCORE_THRESHOLD");
+    const char *stages = g_getenv ("FP_VIRTUAL_IMAGE_ENROLL_STAGES");
+
+    if (algo && *algo)
+      {
+        if (g_str_equal (algo, "nbis"))
+          {
+            /* Default algorithm; nothing to set. */
+          }
+#ifdef HAVE_SIGFM
+        else if (g_str_equal (algo, "sigfm"))
+          {
+            img_class->algorithm = FPI_DEVICE_ALGO_SIGFM;
+          }
+#endif
+        else
+          {
+            g_error ("FP_VIRTUAL_IMAGE_ALGORITHM: unknown or unsupported "
+                     "algorithm '%s'", algo);
+          }
+      }
+
+    if (threshold && *threshold)
+      {
+        gchar *end = NULL;
+        gint64 value = g_ascii_strtoll (threshold, &end, 10);
+
+        if (end == threshold || *end != '\0' || value <= 0 || value > G_MAXINT32)
+          g_error ("FP_VIRTUAL_IMAGE_SCORE_THRESHOLD: invalid value '%s'",
+                   threshold);
+        img_class->score_threshold = value;
+      }
+
+    if (stages && *stages)
+      {
+        gchar *end = NULL;
+        gint64 value = g_ascii_strtoll (stages, &end, 10);
+
+        if (end == stages || *end != '\0' || value <= 0 || value > 100)
+          g_error ("FP_VIRTUAL_IMAGE_ENROLL_STAGES: invalid value '%s'",
+                   stages);
+        dev_class->nr_enroll_stages = value;
+      }
+  }
 }
