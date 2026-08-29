@@ -192,6 +192,28 @@ if get_option('introspection')
         endif
     endforeach
 
+    # A committed fixture set (tests/benchmark-fixtures) exercises the whole
+    # matching-benchmark chain -- export, socket, capture, extraction, match,
+    # score log, equivalence assertions -- in seconds, with no external
+    # dataset and no statistical claims.  It needs the virtual_image driver
+    # and sigfm-bench, so it needs OpenCV; without either, there is nothing
+    # to smoke-test here.
+    if 'virtual_image' in drivers and have_opencv
+        smoke_envs = envs
+        smoke_envs.set('OPENCV_FOR_THREADS_NUM', '1')
+        smoke_envs.set('OPENCV_OPENCL_RUNTIME', 'disabled')
+        test('benchmark-matching-smoke',
+            python3,
+            args: [files('benchmark-matching.py'),
+                   '--smoke', meson.current_source_dir() / 'benchmark-fixtures',
+                   '--builddir', meson.project_build_root()],
+            env: smoke_envs,
+            suite: ['virtual-driver'],
+            timeout: 60,
+            depends: libfprint_typelib,
+        )
+    endif
+
     driver_tests_enabled = false
     foreach driver_test, args: drivers_tests
         driver_name = driver_test.split('-')[0]
