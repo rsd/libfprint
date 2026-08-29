@@ -249,35 +249,115 @@ def sha256_bytes(data):
     return hashlib.sha256(data).hexdigest()
 
 
-def wilson95(k, n):
-    """95% Wilson score interval, clamped to [0, 1].
+def _betacf(a, b, x):
+    """Continued-fraction factor for the regularized incomplete beta
+    function (Numerical Recipes' betacf, Lentz's method)."""
+    maxit = 200
+    eps = 3e-12
+    fpmin = 1e-300
+    qab = a + b
+    qap = a + 1.0
+    qam = a - 1.0
+    c = 1.0
+    d = 1.0 - qab * x / qap
+    if abs(d) < fpmin:
+        d = fpmin
+    d = 1.0 / d
+    h = d
+    for m in range(1, maxit + 1):
+        m2 = 2 * m
+        aa = m * (b - m) * x / ((qam + m2) * (a + m2))
+        d = 1.0 + aa * d
+        if abs(d) < fpmin:
+            d = fpmin
+        c = 1.0 + aa / c
+        if abs(c) < fpmin:
+            c = fpmin
+        d = 1.0 / d
+        h *= d * c
+        aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2))
+        d = 1.0 + aa * d
+        if abs(d) < fpmin:
+            d = fpmin
+        c = 1.0 + aa / c
+        if abs(c) < fpmin:
+            c = fpmin
+        d = 1.0 / d
+        delta = d * c
+        h *= delta
+        if abs(delta - 1.0) < eps:
+            break
+    return h
 
-    Same constant and same arrangement as sigfm-bench's wilson95(), so the two
+
+def _betai(a, b, x):
+    """Regularized incomplete beta function I_x(a, b), i.e. the CDF of a
+    Beta(a, b) distribution at x. Same continued-fraction method as
+    sigfm-bench's betai() (Press et al., "Numerical Recipes"), so the two
+    halves of the benchmark agree by construction, not by coincidence."""
+    if x <= 0.0:
+        return 0.0
+    if x >= 1.0:
+        return 1.0
+    bt = math.exp(math.lgamma(a + b) - math.lgamma(a) - math.lgamma(b) +
+                  a * math.log(x) + b * math.log(1.0 - x))
+    if x < (a + 1.0) / (a + b + 2.0):
+        return bt * _betacf(a, b, x) / a
+    return 1.0 - bt * _betacf(b, a, 1.0 - x) / b
+
+
+def _beta_quantile(a, b, p):
+    """The x with I_x(a, b) == p, found by bisection over [0, 1].
+
+    I_x(a, b) is monotonically increasing in x for a, b > 0, so plain
+    bisection is exact enough (200 halvings is far past double precision)
+    and needs no library beyond lgamma/exp/log -- dependency-free, as
+    sigfm-bench's C++ counterpart also is.
+    """
+    lo, hi = 0.0, 1.0
+    for _ in range(200):
+        mid = (lo + hi) / 2.0
+        if _betai(a, b, mid) < p:
+            lo = mid
+        else:
+            hi = mid
+    return (lo + hi) / 2.0
+
+
+def clopper_pearson95(k, n):
+    """Exact 95% Clopper-Pearson interval, clamped to [0, 1].
+
+    Lower = the alpha/2 quantile of Beta(k, n-k+1); upper = the 1-alpha/2
+    quantile of Beta(k+1, n-k); both quantiles found by bisection on the
+    regularized incomplete beta function (see _betai/_beta_quantile above).
+    Same construction as sigfm-bench's clopper_pearson95(), so the two
     halves of the benchmark quote the same numbers.
     """
-    z = 1.959963984540054
+    alpha = 0.05
     if n <= 0:
         return (0.0, 0.0)
 
-    p = float(k) / n
-    z2 = z * z
-    denom = 1.0 + z2 / n
-    centre = (p + z2 / (2.0 * n)) / denom
-    half = (z / denom) * math.sqrt(p * (1.0 - p) / n + z2 / (4.0 * n * n))
-    return (max(0.0, centre - half), min(1.0, centre + half))
+    lo = 0.0 if k <= 0 else _beta_quantile(k, n - k + 1, alpha / 2.0)
+    hi = 1.0 if k >= n else _beta_quantile(k + 1, n - k, 1.0 - alpha / 2.0)
+    return (lo, hi)
 
 
 def fmt_rate(k, n):
     """A count with its interval, in sigfm-bench's wording.
 
-    A rate of zero is not evidence that the rate is zero, so it prints the
-    rule-of-three upper bound instead of a bare 0.
+    A rate of zero is not evidence that the rate is zero, so it prints a
+    one-sided 95% upper bound (the rule of three, 3/n) instead of a bare 0.
+    This is the one-sided reading of Clopper-Pearson's k=0 corner: with no
+    lower tail to report, all of alpha=0.05 (not alpha/2) goes to the upper
+    tail, giving the exact bound 1 - alpha^(1/n) (Beta(1, n)'s 1-alpha
+    quantile); -ln(0.05) rounds to 3, which is where "rule of three" gets
+    its name.
     """
     if n <= 0:
         return '0/0  (no trials)'
     if k == 0:
         return '0/%d  (95%% upper bound %.3f%%)' % (n, min(300.0 / n, 100.0))
-    lo, hi = wilson95(k, n)
+    lo, hi = clopper_pearson95(k, n)
     return '%d/%d  (95%% CI %.3f%%..%.3f%%)' % (k, n, lo * 100.0, hi * 100.0)
 
 
@@ -1337,33 +1417,61 @@ class TestPgm(unittest.TestCase):
         self.assertEqual(sha256_bytes(px), hashlib.sha256(payload).hexdigest())
 
 
-class TestWilson(unittest.TestCase):
+class TestClopperPearson(unittest.TestCase):
 
-    # Both reference values are the ones sigfm-bench prints for the same
-    # counts (task 6 report, "Statistics, checked against an independent
-    # implementation").
+    # Reference values are the ones sigfm-bench prints for the same counts
+    # (final-fix report, "CP reference-value cross-check"), independently
+    # cross-checked against scipy.stats.beta.ppf (scipy 1.16.3) where
+    # available; the bisection in this module reproduces them to ~13-14
+    # significant digits, i.e. floating-point noise, not an approximation.
     def test_three_in_eighteen_thousand(self):
-        lo, hi = wilson95(3, 18000)
+        lo, hi = clopper_pearson95(3, 18000)
         self.assertEqual('%.3f%%..%.3f%%' % (lo * 100, hi * 100),
-                         '0.006%..0.049%')
+                         '0.003%..0.049%')
 
     def test_all_of_thirty_six(self):
-        lo, hi = wilson95(36, 36)
+        lo, hi = clopper_pearson95(36, 36)
         self.assertEqual('%.3f%%..%.3f%%' % (lo * 100, hi * 100),
-                         '90.358%..100.000%')
+                         '90.261%..100.000%')
 
     def test_clamped_to_unit_interval(self):
-        lo, hi = wilson95(0, 1)
+        lo, hi = clopper_pearson95(0, 1)
         self.assertGreaterEqual(lo, 0.0)
         self.assertLessEqual(hi, 1.0)
 
     def test_no_trials(self):
-        self.assertEqual(wilson95(0, 0), (0.0, 0.0))
+        self.assertEqual(clopper_pearson95(0, 0), (0.0, 0.0))
+
+    def test_zero_count_matches_beta_quantile_literature(self):
+        """Independent cross-check at k=0, n=270: Beta(1, 270)'s exact
+        0.975 quantile (scipy.stats.beta.ppf(0.975, 1, 270) ==
+        0.01356960792115841) is what the two-sided formula's k=0 corner
+        reduces to; this module's bisection reproduces it well past the
+        3rd decimal digit this tool ever prints."""
+        lo, hi = clopper_pearson95(0, 270)
+        self.assertEqual(lo, 0.0)
+        self.assertAlmostEqual(hi, 0.01356960792115841, places=9)
+
+    def test_rule_of_three_approximates_the_one_sided_bound(self):
+        """fmt_rate's k=0 rule-of-three (3/n) is the large-n approximation
+        of the *one-sided* 95% bound at k=0 -- all of alpha=0.05 on the
+        upper tail, not alpha/2 as the two-sided quantiles above use --
+        whose exact value is 1 - 0.05**(1/n); -ln(0.05) ~= 3 is where the
+        name comes from. Reference percentages cross-checked against
+        scipy.stats.beta.ppf(0.95, 1, n)."""
+        cases = (
+            (270, 1.103397884279489, 0.01),
+            (18000, 0.016641572212028333, 0.0001),
+        )
+        for n, one_sided_exact_pct, tol in cases:
+            rule_of_three_pct = min(300.0 / n, 100.0)
+            self.assertAlmostEqual(rule_of_three_pct, one_sided_exact_pct,
+                                   delta=tol)
 
     def test_rate_line_matches_bench_wording(self):
         self.assertEqual(fmt_rate(0, 36), '0/36  (95% upper bound 8.333%)')
         self.assertEqual(fmt_rate(0, 1), '0/1  (95% upper bound 100.000%)')
-        self.assertEqual(fmt_rate(36, 36), '36/36  (95% CI 90.358%..100.000%)')
+        self.assertEqual(fmt_rate(36, 36), '36/36  (95% CI 90.261%..100.000%)')
         self.assertEqual(fmt_rate(0, 0), '0/0  (no trials)')
 
 

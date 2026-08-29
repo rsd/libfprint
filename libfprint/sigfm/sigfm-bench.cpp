@@ -596,31 +596,122 @@ struct Interval {
     double lo = 0, hi = 0;
 };
 
-/* Wilson score interval, 95%. Preferred over the normal approximation
- * because the counts that matter here are tiny relative to N. */
-Interval wilson95(long k, long n)
+/* Continued-fraction factor for the regularized incomplete beta function
+ * (Numerical Recipes' betacf, Lentz's method). Used only by betai() below. */
+double betacf(double a, double b, double x)
 {
-    const double z = 1.959963984540054;
+    const int max_it = 200;
+    const double eps = 3e-12;
+    const double fpmin = 1e-300;
+    const double qab = a + b;
+    const double qap = a + 1.0;
+    const double qam = a - 1.0;
+    double c = 1.0;
+    double d = 1.0 - qab * x / qap;
+
+    if (std::fabs(d) < fpmin)
+        d = fpmin;
+    d = 1.0 / d;
+
+    double h = d;
+
+    for (int m = 1; m <= max_it; m++) {
+        const int m2 = 2 * m;
+        double aa = m * (b - m) * x / ((qam + m2) * (a + m2));
+
+        d = 1.0 + aa * d;
+        if (std::fabs(d) < fpmin)
+            d = fpmin;
+        c = 1.0 + aa / c;
+        if (std::fabs(c) < fpmin)
+            c = fpmin;
+        d = 1.0 / d;
+        h *= d * c;
+
+        aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2));
+        d = 1.0 + aa * d;
+        if (std::fabs(d) < fpmin)
+            d = fpmin;
+        c = 1.0 + aa / c;
+        if (std::fabs(c) < fpmin)
+            c = fpmin;
+        d = 1.0 / d;
+
+        const double delta = d * c;
+
+        h *= delta;
+        if (std::fabs(delta - 1.0) < eps)
+            break;
+    }
+    return h;
+}
+
+/* Regularized incomplete beta function I_x(a, b), i.e. the CDF of a
+ * Beta(a, b) distribution at x, via the continued-fraction method (Press,
+ * Teukolsky, Vetterling, Flannery, "Numerical Recipes", betai()). Chosen
+ * because it needs nothing beyond lgamma/exp/log -- no external stats
+ * library -- and because the same construction is mirrored in
+ * benchmark-matching.py so both halves of the benchmark agree by
+ * construction. */
+double betai(double a, double b, double x)
+{
+    if (x <= 0.0)
+        return 0.0;
+    if (x >= 1.0)
+        return 1.0;
+
+    const double bt = std::exp(std::lgamma(a + b) - std::lgamma(a) -
+                               std::lgamma(b) + a * std::log(x) +
+                               b * std::log(1.0 - x));
+
+    if (x < (a + 1.0) / (a + b + 2.0))
+        return bt * betacf(a, b, x) / a;
+    return 1.0 - bt * betacf(b, a, 1.0 - x) / b;
+}
+
+/* The x with I_x(a, b) == p, found by bisection over [0, 1]. I_x(a, b) is
+ * monotonically increasing in x for a, b > 0, so 100 halvings (far past
+ * double precision) is exact enough without a dedicated root finder. */
+double beta_quantile(double a, double b, double p)
+{
+    double lo = 0.0, hi = 1.0;
+
+    for (int i = 0; i < 100; i++) {
+        const double mid = (lo + hi) / 2.0;
+
+        if (betai(a, b, mid) < p)
+            lo = mid;
+        else
+            hi = mid;
+    }
+    return (lo + hi) / 2.0;
+}
+
+/* Exact Clopper-Pearson interval, 95%. The spec binds this method by name:
+ * unlike Wilson/normal-approximation intervals, it is never anti-conservative
+ * at small event counts, which is exactly the impostor-tail regime a
+ * security review cares about. Lower = the alpha/2 quantile of
+ * Beta(k, n-k+1); upper = the 1-alpha/2 quantile of Beta(k+1, n-k). */
+Interval clopper_pearson95(long k, long n)
+{
+    const double alpha = 0.05;
 
     if (n <= 0)
         return Interval();
 
-    const double p = static_cast<double>(k) / n;
-    const double z2 = z * z;
-    const double denom = 1.0 + z2 / n;
-    const double centre = (p + z2 / (2.0 * n)) / denom;
-    const double half = (z / denom) *
-                        std::sqrt(p * (1.0 - p) / n +
-                                  z2 / (4.0 * static_cast<double>(n) * n));
     Interval iv;
 
-    iv.lo = centre - half < 0.0 ? 0.0 : centre - half;
-    iv.hi = centre + half > 1.0 ? 1.0 : centre + half;
+    iv.lo = k <= 0 ? 0.0 : beta_quantile(k, n - k + 1, alpha / 2.0);
+    iv.hi = k >= n ? 1.0 : beta_quantile(k + 1, n - k, 1.0 - alpha / 2.0);
     return iv;
 }
 
 /* A rate of zero is not evidence that the rate is zero: with no observed
- * event in n trials the 95% upper bound is 3/n. */
+ * event in n trials the one-sided 95% upper bound is 3/n. This is the
+ * one-sided reading of Clopper-Pearson's own k=0 corner: with no lower tail
+ * to report, all of alpha=0.05 (not alpha/2) goes to the upper tail, giving
+ * the exact bound 1 - alpha^(1/n) (Beta(1, n)'s 1-alpha quantile); -ln(0.05)
+ * rounds to 3, which is where "rule of three" gets its name. */
 void print_rate(const char* label, long k, long n)
 {
     if (n <= 0) {
@@ -635,7 +726,7 @@ void print_rate(const char* label, long k, long n)
         return;
     }
 
-    const Interval iv = wilson95(k, n);
+    const Interval iv = clopper_pearson95(k, n);
 
     std::printf("%-20s: %ld/%ld  (95%% CI %.3f%%..%.3f%%)\n", label, k, n,
                 iv.lo * 100.0, iv.hi * 100.0);
