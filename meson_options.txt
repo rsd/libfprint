@@ -34,3 +34,7 @@ option('installed-tests',
        description: 'Whether to install the installed tests',
        type: 'boolean',
        value: true)
+option('synaptics0078_data_dir',
+       description: 'Directory the synaptics0078 driver reads its capture module and per-unit program from (FP_SYNAPTICS0078_DATA_DIR overrides it at run time)',
+       type: 'string',
+       value: '/var/lib/fprint/synaptics0078')

@@ -324,6 +324,11 @@ usb:v06CBp01A4*
  ID_AUTOSUSPEND=1
  ID_PERSIST=0
 
+# Supported by libfprint driver synaptics0078
+usb:v06CBp0078*
+ ID_AUTOSUSPEND=1
+ ID_PERSIST=0
+
 # Supported by libfprint driver upeksonly
 usb:v147Ep2016*
 usb:v147Ep1000*

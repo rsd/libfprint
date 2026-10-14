@@ -15,6 +15,7 @@ python3 = find_program('python3')
 
 libfprint_conf = configuration_data()
 libfprint_conf.set_quoted('LIBFPRINT_VERSION', meson.project_version())
+libfprint_conf.set_quoted('SYNAPTICS0078_DATA_DIR', get_option('synaptics0078_data_dir'))
 
 prefix = get_option('prefix')
 libdir = prefix / get_option('libdir')
@@ -160,6 +161,9 @@ drivers_info = {
     'mafpmoc': {},
     'secugen': {},
 
+    # SIGFM driver (non-optional if OpenCV is available)
+    'synaptics0078': { 'sigfm': true, 'optional': not have_opencv },
+
     # SPI driver (non-optional if SPI is available)
     'elanspi': { 'spi': true, 'helper': ['udev'], 'optional': not have_spi },
 
@@ -302,6 +306,14 @@ foreach driver: drivers
 endforeach
 
 if default_drivers_are_enabled and supported_drivers != drivers
+    default_drivers_are_enabled = false
+endif
+
+# data/autosuspend.hwdb is generated from the drivers that are compiled in, and
+# the checked-in copy covers every driver enabled by default, SIGFM ones
+# included. Without OpenCV those drop out of default_drivers, so such a build
+# generates a smaller file and cannot be used to validate the checked-in copy.
+if not have_opencv
     default_drivers_are_enabled = false
 endif
 
