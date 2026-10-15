@@ -74,11 +74,28 @@
  * inconclusive and ends the probe the same way. A window without a finger
  * event means the finger is off; the sensor is then left armed, so the next
  * AWAIT_FINGER_ON only listens.
+ *
+ * Debug aids, read at open and off unless their variable is set (only root
+ * controls fprintd's environment):
+ *   FP_SYNAPTICS0078_DUMP_DIR          logs mean, sd, ridge coverage, gradient
+ *                                      and the mean absolute difference to the
+ *                                      last delivered image for every 51 image
+ *                                      (captures and the discarded finger-off
+ *                                      probe images), and writes each as
+ *                                      <seq>-<monotonic ms>-<tag>.pgm (144x56,
+ *                                      native) into this directory (created
+ *                                      0700, files 0600). Biometric data: point
+ *                                      it at a private, untracked directory.
+ *   FP_SYNAPTICS0078_PROBE_WINDOW_MS   finger-off probe window, 50..10000
+ *   FP_SYNAPTICS0078_PROBE_BACKOFF_MS  pause between finger-off probes, 0..60000
  */
 
 #define FP_COMPONENT "synaptics0078"
 
 #include "drivers_api.h"
+
+#include <errno.h>
+#include <math.h>
 
 #define SYNAPTICS0078_EP_OUT 0x01
 #define SYNAPTICS0078_EP_IN 0x81
@@ -107,14 +124,38 @@
 #define SYNAPTICS0078_FINGER_OFF_PROBE_MS 500
 #define SYNAPTICS0078_FINGER_OFF_RETRY_MS 250
 
+/* Debug aids (see the top of the file). */
+#define SYNAPTICS0078_DUMP_DIR_ENV "FP_SYNAPTICS0078_DUMP_DIR"
+#define SYNAPTICS0078_PROBE_WINDOW_ENV "FP_SYNAPTICS0078_PROBE_WINDOW_MS"
+#define SYNAPTICS0078_PROBE_BACKOFF_ENV "FP_SYNAPTICS0078_PROBE_BACKOFF_MS"
+/* Ridge coverage as proto/parsers.py image_quality(): the share of 8x8
+ * blocks whose standard deviation exceeds 15 grey levels. */
+#define DIAG_BLOCK 8
+#define DIAG_BLOCK_SD 15.0
+
 #define SYNAPTICS0078_IMAGE_WIDTH 144
 #define SYNAPTICS0078_IMAGE_HEIGHT 56
 /*
- * The 144x56 image reaches SIGFM upscaled by nearest-neighbour pixel
- * replication (SIGFM ignores FpiImageFlags, so scaling happens here). 2x was
- * the best measured variant; confirmed or changed in A5.
+ * Matching parameters, set in A5 from the reference captures; the data and
+ * the rules are in fingerprint-06cb-0078/research/steps/a5-threshold.md.
+ *
+ * UPSCALE: the 144x56 image reaches SIGFM upscaled by nearest-neighbour pixel
+ * replication (SIGFM ignores FpiImageFlags, so scaling happens here). 2x beat
+ * 1x: no impostor score above 0 (1x: 6) and fewer false rejects at every
+ * enrollment size.
+ *
+ * SCORE_THRESHOLD: SIGFM scores grow with about the 4th power of the
+ * consistent keypoint matches; m matches that all agree score
+ * C(C(m, 2), 2). 105 is the score of 6 such matches: the first whole count at
+ * least two matches above the highest impostor score seen (6, at 1x, worth
+ * ~3.4 matches).
+ *
+ * ENROLL_STAGES: one touch covers only about 7 x 3 mm of the finger, so false
+ * rejects come from enrollment coverage; they were still falling at 9 images.
  */
 #define SYNAPTICS0078_UPSCALE 2
+#define SYNAPTICS0078_SCORE_THRESHOLD 105
+#define SYNAPTICS0078_ENROLL_STAGES 18
 
 #define SYNAPTICS0078_DATA_DIR_ENV "FP_SYNAPTICS0078_DATA_DIR"
 #define SYNAPTICS0078_MODULE_FILE "module.bin"
@@ -212,6 +253,15 @@ struct _FpiDeviceSynaptics0078
   guint                probe_count;
   gint64               probe_start_us;
   gint64               window_deadline_us;
+  guint                probe_window_ms;
+  guint                probe_backoff_ms;
+
+  /* Debug aids (SYNAPTICS0078_DUMP_DIR_ENV); diag_dir NULL = off */
+  gchar               *diag_dir;
+  gboolean             diag_write_failed; /* warned once, no more writes */
+  guint                diag_seq;
+  guint8              *diag_last_capture; /* native pixels of the last image delivered */
+  gint64               arm_reply_us; /* reply to the last 02, 0 = none yet */
 };
 G_DECLARE_FINAL_TYPE (FpiDeviceSynaptics0078, fpi_device_synaptics0078, FPI,
                       DEVICE_SYNAPTICS0078, FpImageDevice);
@@ -281,6 +331,8 @@ clear_session_data (FpiDeviceSynaptics0078 *self)
   g_clear_pointer (&self->program, g_bytes_unref);
   g_clear_pointer (&self->serial, g_free);
   self->module_state = 0;
+  g_clear_pointer (&self->diag_dir, g_free);
+  g_clear_pointer (&self->diag_last_capture, g_free);
 }
 
 static void
@@ -774,6 +826,208 @@ load_data_files (FpiDeviceSynaptics0078 *self,
   return TRUE;
 }
 
+/* ======================= Debug aids ======================== */
+
+/* A millisecond value from @name within [@min, @max], else @fallback. */
+static guint
+debug_ms_from_env (const gchar *name,
+                   guint        fallback,
+                   guint        min,
+                   guint        max)
+{
+  const gchar *raw = g_getenv (name);
+  g_autoptr(GError) error = NULL;
+  guint64 value;
+
+  if (raw == NULL || *raw == '\0')
+    return fallback;
+
+  if (!g_ascii_string_to_unsigned (raw, 10, min, max, &value, &error))
+    {
+      fp_warn ("Ignoring %s=%s: %s", name, raw, error->message);
+      return fallback;
+    }
+
+  fp_info ("Debug override: %s=%u ms (default %u ms)", name, (guint) value, fallback);
+  return (guint) value;
+}
+
+static void
+load_debug_settings (FpiDeviceSynaptics0078 *self)
+{
+  const gchar *dir = g_getenv (SYNAPTICS0078_DUMP_DIR_ENV);
+
+  self->probe_window_ms = debug_ms_from_env (SYNAPTICS0078_PROBE_WINDOW_ENV,
+                                             SYNAPTICS0078_FINGER_OFF_PROBE_MS,
+                                             50, 10000);
+  self->probe_backoff_ms = debug_ms_from_env (SYNAPTICS0078_PROBE_BACKOFF_ENV,
+                                              SYNAPTICS0078_FINGER_OFF_RETRY_MS,
+                                              0, 60000);
+
+  self->diag_write_failed = FALSE;
+  self->diag_seq = 0;
+  if (dir == NULL || *dir == '\0')
+    return;
+
+  self->diag_dir = g_strdup (dir);
+  if (g_mkdir_with_parents (dir, 0700) != 0)
+    {
+      /* Stats are still logged; only the image files are skipped. */
+      fp_warn ("Cannot create %s=%s: %s; logging image stats only",
+               SYNAPTICS0078_DUMP_DIR_ENV, dir, g_strerror (errno));
+      self->diag_write_failed = TRUE;
+    }
+  fp_info ("Debug: image stats on, images dumped to %s", dir);
+}
+
+/* Writes @pixels (native size) as a PGM; never fails the caller. */
+static void
+diag_write_pgm (FpiDeviceSynaptics0078 *self,
+                const gchar            *name,
+                const gchar            *comment,
+                const guint8           *pixels)
+{
+  const gsize n_pixels = SYNAPTICS0078_IMAGE_WIDTH * SYNAPTICS0078_IMAGE_HEIGHT;
+  g_autofree gchar *path = NULL;
+  g_autoptr(GByteArray) data = g_byte_array_new ();
+  g_autoptr(GError) error = NULL;
+  g_autofree gchar *header = NULL;
+
+  if (self->diag_write_failed)
+    return;
+
+  header = g_strdup_printf ("P5\n# %s\n%d %d\n255\n", comment,
+                            SYNAPTICS0078_IMAGE_WIDTH, SYNAPTICS0078_IMAGE_HEIGHT);
+  g_byte_array_append (data, (const guint8 *) header, strlen (header));
+  g_byte_array_append (data, pixels, n_pixels);
+
+  /* CONSISTENT writes a temporary file and renames it: a symlink at the
+   * target is replaced, never followed. */
+  path = g_build_filename (self->diag_dir, name, NULL);
+  if (!g_file_set_contents_full (path, (const gchar *) data->data, data->len,
+                                 G_FILE_SET_CONTENTS_CONSISTENT, 0600, &error))
+    {
+      fp_warn ("Cannot write %s: %s; no further image files", path, error->message);
+      self->diag_write_failed = TRUE;
+    }
+}
+
+/*
+ * Logs the stats of a 51 reply that carries a full image (an error header
+ * may still carry pixels) and dumps it; remembers a delivered capture as the
+ * reference for the difference. A no-op unless the debug aid is on.
+ */
+static void
+diag_image (FpiDeviceSynaptics0078 *self,
+            FpiUsbTransfer         *transfer,
+            gboolean                delivered)
+{
+  const gint width = SYNAPTICS0078_IMAGE_WIDTH;
+  const gint height = SYNAPTICS0078_IMAGE_HEIGHT;
+  const gsize n_pixels = width * height;
+  const guint8 *reply = transfer->buffer;
+  const guint8 *px;
+  g_autofree gchar *tag = NULL;
+  g_autofree gchar *name = NULL;
+  g_autofree gchar *comment = NULL;
+  g_autofree gchar *diff_text = NULL;
+  gint64 now_us = g_get_monotonic_time ();
+  gdouble sum = 0, sq = 0, mean, sd, grad = 0, diff = 0;
+  guint grad_n = 0, blocks = 0, covered = 0;
+  gint x, y, bx, by;
+  gsize i;
+
+  if (self->diag_dir == NULL ||
+      transfer->actual_length != (gssize) (IMAGE_HEADER_LEN + n_pixels) ||
+      read_u32le (reply, 2) != (guint32) (transfer->actual_length - 6))
+    return;
+
+  px = reply + IMAGE_HEADER_LEN;
+  self->diag_seq++;
+
+  for (i = 0; i < n_pixels; i++)
+    {
+      sum += px[i];
+      sq += (gdouble) px[i] * px[i];
+    }
+  mean = sum / n_pixels;
+  sd = sqrt (MAX (sq / n_pixels - mean * mean, 0));
+
+  /* Ridge contrast: mean absolute difference of neighbouring pixels. */
+  for (y = 0; y < height; y++)
+    for (x = 0; x < width; x++)
+      {
+        if (x + 1 < width)
+          {
+            grad += ABS (px[y * width + x + 1] - px[y * width + x]);
+            grad_n++;
+          }
+        if (y + 1 < height)
+          {
+            grad += ABS (px[(y + 1) * width + x] - px[y * width + x]);
+            grad_n++;
+          }
+      }
+  grad /= grad_n;
+
+  for (by = 0; by < height / DIAG_BLOCK; by++)
+    for (bx = 0; bx < width / DIAG_BLOCK; bx++)
+      {
+        gdouble bsum = 0, bsq = 0, bmean;
+        const gint n = DIAG_BLOCK * DIAG_BLOCK;
+
+        for (y = by * DIAG_BLOCK; y < (by + 1) * DIAG_BLOCK; y++)
+          for (x = bx * DIAG_BLOCK; x < (bx + 1) * DIAG_BLOCK; x++)
+            {
+              bsum += px[y * width + x];
+              bsq += (gdouble) px[y * width + x] * px[y * width + x];
+            }
+        bmean = bsum / n;
+        blocks++;
+        if (sqrt (MAX (bsq / n - bmean * bmean, 0)) > DIAG_BLOCK_SD)
+          covered++;
+      }
+
+  if (self->diag_last_capture)
+    {
+      for (i = 0; i < n_pixels; i++)
+        diff += ABS (px[i] - self->diag_last_capture[i]);
+      diff_text = g_strdup_printf ("%.1f", diff / n_pixels);
+    }
+  else
+    {
+      diff_text = g_strdup ("-");
+    }
+
+  tag = self->probing ? g_strdup_printf ("probe%02u", self->probe_count) :
+        g_strdup ("capture");
+  name = g_strdup_printf ("%06u-%011" G_GINT64_FORMAT "ms-%s%s.pgm",
+                          self->diag_seq, now_us / 1000, tag,
+                          (read_u16le (reply, 0) != 0 || read_u32le (reply, 14) != 0) ?
+                          "-err" : "");
+
+  fp_dbg ("Diag image %u %s: mean %.1f, sd %.2f, coverage %.0f%%, "
+          "gradient %.1f, diff vs last capture %s, %" G_GINT64_FORMAT
+          " ms after 02, file %s",
+          self->diag_seq, tag, mean, sd, 100.0 * covered / blocks, grad,
+          diff_text, self->arm_reply_us ? (now_us - self->arm_reply_us) / 1000 : -1,
+          name);
+
+  comment = g_strdup_printf ("synaptics0078 seq %u monotonic_us %" G_GINT64_FORMAT
+                             " %s status 0x%04x length %u x %u y %u w1 %u w2 %u error 0x%08x",
+                             self->diag_seq, now_us, tag, read_u16le (reply, 0),
+                             read_u32le (reply, 2), read_u16le (reply, 6),
+                             read_u16le (reply, 8), read_u16le (reply, 10),
+                             read_u16le (reply, 12), read_u32le (reply, 14));
+  diag_write_pgm (self, name, comment, px);
+
+  if (delivered)
+    {
+      g_free (self->diag_last_capture);
+      self->diag_last_capture = g_memdup2 (px, n_pixels);
+    }
+}
+
 /* ======================= Open / close ====================== */
 
 /*
@@ -896,6 +1150,7 @@ dev_open (FpImageDevice *dev)
   FpiSsm *ssm;
 
   clear_session_data (self);
+  load_debug_settings (self);
 
   if (!g_usb_device_claim_interface (fpi_device_get_usb_device (FP_DEVICE (dev)),
                                      SYNAPTICS0078_INTERFACE, 0, &error))
@@ -1022,6 +1277,7 @@ dev_activate (FpImageDevice *dev)
   self->deactivating = FALSE;
   self->armed = FALSE;
   self->pause_pending = FALSE;
+  self->arm_reply_us = 0;
   g_clear_object (&self->interrupt_cancellable);
   self->interrupt_cancellable = g_cancellable_new ();
 
@@ -1283,6 +1539,7 @@ remaining_ms (gint64 deadline_us)
 /* Classifies one EP 0x83 event as proto/parsers.py classify_interrupt(). */
 static enum event_action
 classify_event (FpiUsbTransfer *transfer,
+                gint64          arm_reply_us,
                 guint16        *code)
 {
   const guint8 *data = transfer->buffer;
@@ -1321,8 +1578,13 @@ classify_event (FpiUsbTransfer *transfer,
         }
     }
 
-  fp_dbg ("EP 0x%02x event %s: %s", SYNAPTICS0078_EP_INT, hex,
-          event_action_names[action]);
+  if (arm_reply_us > 0)
+    fp_dbg ("EP 0x%02x event %s: %s (+%" G_GINT64_FORMAT " ms after 02)",
+            SYNAPTICS0078_EP_INT, hex, event_action_names[action],
+            (g_get_monotonic_time () - arm_reply_us) / 1000);
+  else
+    fp_dbg ("EP 0x%02x event %s: %s", SYNAPTICS0078_EP_INT, hex,
+            event_action_names[action]);
 
   return action;
 }
@@ -1372,9 +1634,9 @@ parse_image_reply (FpiUsbTransfer *transfer,
       y = read_u16le (reply, 8);
       image_error = read_u32le (reply, 14);
       fp_dbg ("Image reply: %" G_GSSIZE_FORMAT " bytes, status 0x%04x, "
-              "x %u, y %u, w1 %u, w2 %u, error 0x%08x",
-              length, status, x, y, read_u16le (reply, 10),
-              read_u16le (reply, 12), image_error);
+              "length %u, x %u, y %u, w1 %u, w2 %u, error 0x%08x",
+              length, status, read_u32le (reply, 2), x, y,
+              read_u16le (reply, 10), read_u16le (reply, 12), image_error);
     }
   else
     {
@@ -1572,7 +1834,7 @@ capture_interrupt_cb (FpiUsbTransfer *transfer, FpDevice *dev,
       return;
     }
 
-  action = classify_event (transfer, &code);
+  action = classify_event (transfer, self->arm_reply_us, &code);
 
   if (state == CAPTURE_WAIT_FINGER)
     {
@@ -1652,9 +1914,10 @@ handle_arm_reply (FpiDeviceSynaptics0078 *self,
     fp_dbg ("Command 0x%02x: reply is %" G_GSSIZE_FORMAT " bytes, expected %d",
             CMD_PROGRAM, transfer->actual_length, PROGRAM_REPLY_LEN);
 
+  self->arm_reply_us = g_get_monotonic_time ();
   if (self->probing)
-    self->window_deadline_us = g_get_monotonic_time () +
-                               SYNAPTICS0078_FINGER_OFF_PROBE_MS * G_TIME_SPAN_MILLISECOND;
+    self->window_deadline_us = self->arm_reply_us +
+                               self->probe_window_ms * G_TIME_SPAN_MILLISECOND;
 
   fpi_ssm_next_state (transfer->ssm);
 }
@@ -1687,6 +1950,7 @@ handle_image_reply (FpiDeviceSynaptics0078 *self,
 
   self->image_replies++;
   kind = parse_image_reply (transfer, &pixels, &reply_error);
+  diag_image (self, transfer, !self->probing && kind == IMAGE_REPLY_IMAGE);
 
   if (kind == IMAGE_REPLY_NOT_READY &&
       self->image_replies < SYNAPTICS0078_IMAGE_MAX_REPLIES)
@@ -1796,7 +2060,7 @@ capture_run_state (FpiSsm *ssm, FpDevice *dev)
           fp_dbg ("Sensor already armed, listening on EP 0x%02x",
                   SYNAPTICS0078_EP_INT);
           self->window_deadline_us = g_get_monotonic_time () +
-                                     SYNAPTICS0078_FINGER_OFF_PROBE_MS * G_TIME_SPAN_MILLISECOND;
+                                     self->probe_window_ms * G_TIME_SPAN_MILLISECOND;
           fpi_ssm_jump_to_state (ssm, CAPTURE_WAIT_FINGER);
           break;
         }
@@ -1855,7 +2119,7 @@ capture_run_state (FpiSsm *ssm, FpDevice *dev)
     case CAPTURE_PAUSE:
       self->pause_pending = TRUE;
       fpi_ssm_jump_to_state_delayed (ssm, CAPTURE_ARM_SEND,
-                                     SYNAPTICS0078_FINGER_OFF_RETRY_MS);
+                                     self->probe_backoff_ms);
       break;
 
     case CAPTURE_CLEANUP:
@@ -2006,6 +2270,9 @@ static const FpIdEntry id_table[] = {
 static void
 fpi_device_synaptics0078_init (FpiDeviceSynaptics0078 *self)
 {
+  /* load_debug_settings() at open may override these. */
+  self->probe_window_ms = SYNAPTICS0078_FINGER_OFF_PROBE_MS;
+  self->probe_backoff_ms = SYNAPTICS0078_FINGER_OFF_RETRY_MS;
 }
 
 static void
@@ -2034,11 +2301,12 @@ fpi_device_synaptics0078_class_init (FpiDeviceSynaptics0078Class *klass)
   dev_class->type = FP_DEVICE_TYPE_USB;
   dev_class->id_table = id_table;
   dev_class->scan_type = FP_SCAN_TYPE_PRESS;
-  /* nr_enroll_stages and score_threshold keep their defaults; A5 sets them. */
+  dev_class->nr_enroll_stages = SYNAPTICS0078_ENROLL_STAGES;
 
   img_class->img_width = SYNAPTICS0078_IMAGE_WIDTH * SYNAPTICS0078_UPSCALE;
   img_class->img_height = SYNAPTICS0078_IMAGE_HEIGHT * SYNAPTICS0078_UPSCALE;
   img_class->algorithm = FPI_DEVICE_ALGO_SIGFM;
+  img_class->score_threshold = SYNAPTICS0078_SCORE_THRESHOLD;
 
   img_class->img_open = dev_open;
   img_class->img_close = dev_close;
