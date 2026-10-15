@@ -66,20 +66,63 @@
  * A failed/aborted event, an error in the image header or status 0x0412
  * ("no capture in progress") on 51 is a retry, not an error.
  *
- * Finger off (change_state AWAIT_FINGER_OFF): the sensor sends no event when
- * the finger is lifted, so the driver re-arms it (02) and listens for a short
- * window. A finger event in the window means the finger is still down: the
- * image is read and discarded, 04/52 end the capture and the probe repeats
- * after a pause. A failed/aborted event or a missing image-ready event is
- * inconclusive and ends the probe the same way. A window without a finger
- * event means the finger is off; the sensor is then left armed, so the next
- * AWAIT_FINGER_ON only listens.
+ * Reference image: the native pixels of the last image handed to the core.
+ * It is replaced on every delivered capture and kept across deactivate /
+ * activate and close / open (freed only when the device object goes away),
+ * so fprintd's identify -> enroll back-to-back activation and a new verify
+ * right after the previous one both compare against the touch just used. It
+ * is held only in memory and never written (except by the opt-in dump
+ * below). Why: residue and held-finger replays come right after the previous
+ * action (identify -> enroll 3 ms apart, consecutive verifies ~1 s apart),
+ * while a genuinely new touch always differed from it by >= 48.
+ *
+ * Stale reference: a retry is a touch that was not handed to the core, so
+ * after one the reference is an older touch than the finger on the sensor.
+ * Until the next delivered image it is not used at all: finger-off probing
+ * falls back to the finger event alone (no event = off, an event = still
+ * down), since the held finger would differ from the older touch and read as
+ * a new one; and the capture guard below is skipped, since comparing a touch
+ * with an older one cannot recognise a replay of the retried touch and
+ * could only reject a genuine touch that happens to resemble the older one.
+ *
+ * Same-touch guard (AWAIT_FINGER_ON): a captured image whose mean absolute
+ * difference to the reference is below SYNAPTICS0078_NEW_TOUCH_DIFF is the
+ * same touch. It is not handed to the core and does not replace the
+ * reference; the capture SSM waits for finger off as below. A probe that
+ * sees a new touch during that wait hands its image to the core as the
+ * capture. A wait that ends without a finger event (the driver saw the lift)
+ * lets the next touch of this capture through without the guard, once, so a
+ * finger whose touches keep resembling the reference costs at most one
+ * extra lift and touch, never a lockout. The residual risk: a probe window
+ * that misses a late replayed finger event reports a lift that did not
+ * happen, and the replay then gets through once. The finger is reported
+ * present only when an image (or a retry) is handed to the core, not at the
+ * EP 0x83 finger event, as the guard may still discard the touch.
+ *
+ * Finger off (change_state AWAIT_FINGER_OFF, and the guard's wait): the
+ * sensor sends no event when the finger is lifted, so the driver re-arms it
+ * (02) and listens for a short window. A finger event in the window means a
+ * finger is down and its image is read:
+ *   - differing from the reference by >= SYNAPTICS0078_NEW_TOUCH_DIFF, it is
+ *     a new touch, i.e. the finger was lifted and placed again: 04/52 end the
+ *     capture and finger off is reported at once (no pause); the next
+ *     AWAIT_FINGER_ON arms with 02 and captures that touch (in the guard's
+ *     wait the image itself is the capture, see above);
+ *   - otherwise (same touch, an error reply, no reference yet or a stale
+ *     one) the finger is still down: 04/52 end the capture and the probe
+ *     repeats after a pause, which grows to
+ *     SYNAPTICS0078_PROBE_SLOW_BACKOFF_MS after
+ *     SYNAPTICS0078_PROBE_SLOW_AFTER_MS of probing.
+ * A failed/aborted event or a missing image-ready event is inconclusive and
+ * ends the probe the same way. A window without a finger event means the
+ * finger is off; the sensor is then left armed, so the next AWAIT_FINGER_ON
+ * (or the guard's next touch) only listens.
  *
  * Debug aids, read at open and off unless their variable is set (only root
  * controls fprintd's environment):
  *   FP_SYNAPTICS0078_DUMP_DIR          logs mean, sd, ridge coverage, gradient
  *                                      and the mean absolute difference to the
- *                                      last delivered image for every 51 image
+ *                                      reference image for every 51 image
  *                                      (captures and the discarded finger-off
  *                                      probe images), and writes each as
  *                                      <seq>-<monotonic ms>-<tag>.pgm (144x56,
@@ -123,6 +166,29 @@
  */
 #define SYNAPTICS0078_FINGER_OFF_PROBE_MS 500
 #define SYNAPTICS0078_FINGER_OFF_RETRY_MS 250
+
+/*
+ * New touch vs same touch: mean absolute difference of the native 144x56
+ * pixels to the reference image (see the top of the file). In the A4 dev runs
+ * (local/logs/a4-capture-20261015-09*.log and -104054.log) the same touch
+ * with the finger held still differed by 3.6-16.5, a new touch by 48-54,
+ * even when the user aimed for the same spot. 30 is ~13.5 above the highest
+ * same-touch value and ~18 below the lowest new-touch value (the geometric
+ * midpoint of 16.5 and 48 is ~28).
+ */
+#define SYNAPTICS0078_NEW_TOUCH_DIFF 30
+
+/*
+ * Slow finger-off probing: after this much continuous "still down" probing
+ * the pause between probes becomes at least SLOW_BACKOFF_MS. Real lifts in
+ * the dev runs ended probing on the first probe, while the fprintd ghost of
+ * 2026-10-15 00:29-00:33 said "still down" for 16-45 s at ~2 images/s (each
+ * probe ~430-650 ms with the 250 ms pause), so 30 s is past any real hold
+ * seen. A 1 s pause bounds the lift latency to ~1.5 s and roughly halves the
+ * image churn.
+ */
+#define SYNAPTICS0078_PROBE_SLOW_AFTER_MS 30000
+#define SYNAPTICS0078_PROBE_SLOW_BACKOFF_MS 1000
 
 /* Debug aids (see the top of the file). */
 #define SYNAPTICS0078_DUMP_DIR_ENV "FP_SYNAPTICS0078_DUMP_DIR"
@@ -240,11 +306,14 @@ struct _FpiDeviceSynaptics0078
   GError              *deactivate_error;
 
   /* Current run of the capture SSM */
-  gboolean             probing;      /* FALSE: capture, TRUE: finger-off probing */
+  gboolean             finger_off_run; /* run started for AWAIT_FINGER_OFF */
+  gboolean             probing;      /* finger-off probing now: the whole
+                                      * finger-off run, or a guard wait */
   enum capture_outcome outcome;
-  gboolean             finger_reported;
   gboolean             finger_off;
   FpImage             *capture_image;
+  guint8              *capture_pixels; /* native pixels of capture_image */
+  gdouble              capture_diff; /* vs the reference, < 0 = none */
   gint64               ready_deadline_us;
   guint                image_replies;
   gboolean             image_reread;
@@ -255,12 +324,22 @@ struct _FpiDeviceSynaptics0078
   gint64               window_deadline_us;
   guint                probe_window_ms;
   guint                probe_backoff_ms;
+  gboolean             probe_slow_logged;
+  gboolean             new_touch;    /* a probe saw a new touch */
+  gdouble              new_touch_diff;
+  gboolean             guard_bypass; /* the guard's wait saw the lift: the
+                                      * next touch of this run skips it */
+
+  /* Native pixels of the last image handed to the core (the reference, see
+   * the top of the file); kept across activations and open/close, as is
+   * reference_stale (a retry since, the reference is not used). */
+  guint8              *last_capture;
+  gboolean             reference_stale;
 
   /* Debug aids (SYNAPTICS0078_DUMP_DIR_ENV); diag_dir NULL = off */
   gchar               *diag_dir;
   gboolean             diag_write_failed; /* warned once, no more writes */
   guint                diag_seq;
-  guint8              *diag_last_capture; /* native pixels of the last image delivered */
   gint64               arm_reply_us; /* reply to the last 02, 0 = none yet */
 };
 G_DECLARE_FINAL_TYPE (FpiDeviceSynaptics0078, fpi_device_synaptics0078, FPI,
@@ -294,11 +373,12 @@ enum activate_states {
 
 /*
  * One SSM serves both the capture (AWAIT_FINGER_ON) and the finger-off
- * probing (AWAIT_FINGER_OFF), see self->probing. CAPTURE_DISARM and
- * CAPTURE_PAUSE are reached only while probing. CAPTURE_CLEANUP is the
- * cleanup state: errors, retries, a delivered image and deactivation all end
- * there, and it runs 04/52 whenever the sensor is armed, except after a
- * finger-off report.
+ * probing (AWAIT_FINGER_OFF), see self->finger_off_run. A capture run probes
+ * too while its same-touch guard waits for finger off (self->probing).
+ * CAPTURE_DISARM and CAPTURE_PAUSE are reached only while probing.
+ * CAPTURE_CLEANUP is the cleanup state: errors, retries, a delivered image
+ * and deactivation all end there, and it runs 04/52 whenever the sensor is
+ * armed, except after a finger-off report.
  */
 enum capture_states {
   CAPTURE_ARM_SEND,
@@ -332,7 +412,7 @@ clear_session_data (FpiDeviceSynaptics0078 *self)
   g_clear_pointer (&self->serial, g_free);
   self->module_state = 0;
   g_clear_pointer (&self->diag_dir, g_free);
-  g_clear_pointer (&self->diag_last_capture, g_free);
+  /* self->last_capture is kept: see the top of the file. */
 }
 
 static void
@@ -340,6 +420,7 @@ clear_capture_data (FpiDeviceSynaptics0078 *self)
 {
   g_clear_object (&self->interrupt_cancellable);
   g_clear_object (&self->capture_image);
+  g_clear_pointer (&self->capture_pixels, g_free);
   g_clear_error (&self->deactivate_error);
 }
 
@@ -826,6 +907,44 @@ load_data_files (FpiDeviceSynaptics0078 *self,
   return TRUE;
 }
 
+/* ==================== Touch decisions ====================== */
+
+/* Pure helpers (no device state), so they can be checked on their own. */
+
+/* Mean absolute difference of two native 144x56 images, 0..255. */
+static gdouble
+image_diff (const guint8 *a,
+            const guint8 *b)
+{
+  const gsize n_pixels = SYNAPTICS0078_IMAGE_WIDTH * SYNAPTICS0078_IMAGE_HEIGHT;
+  guint64 sum = 0;
+  gsize i;
+
+  for (i = 0; i < n_pixels; i++)
+    sum += ABS ((gint) a[i] - (gint) b[i]);
+
+  return (gdouble) sum / n_pixels;
+}
+
+/* An image differing by @diff from the reference is a new touch. */
+static gboolean
+is_new_touch (gdouble diff,
+              gint    threshold)
+{
+  return diff >= threshold;
+}
+
+/* Pause before the next finger-off probe after @elapsed_ms of probing. */
+static guint
+probe_pause_ms (gint64 elapsed_ms,
+                guint  backoff_ms)
+{
+  if (elapsed_ms >= SYNAPTICS0078_PROBE_SLOW_AFTER_MS)
+    return MAX (backoff_ms, SYNAPTICS0078_PROBE_SLOW_BACKOFF_MS);
+
+  return backoff_ms;
+}
+
 /* ======================= Debug aids ======================== */
 
 /* A millisecond value from @name within [@min, @max], else @fallback. */
@@ -914,13 +1033,12 @@ diag_write_pgm (FpiDeviceSynaptics0078 *self,
 
 /*
  * Logs the stats of a 51 reply that carries a full image (an error header
- * may still carry pixels) and dumps it; remembers a delivered capture as the
- * reference for the difference. A no-op unless the debug aid is on.
+ * may still carry pixels) and dumps it; the difference is to the reference
+ * image. A no-op unless the debug aid is on.
  */
 static void
 diag_image (FpiDeviceSynaptics0078 *self,
-            FpiUsbTransfer         *transfer,
-            gboolean                delivered)
+            FpiUsbTransfer         *transfer)
 {
   const gint width = SYNAPTICS0078_IMAGE_WIDTH;
   const gint height = SYNAPTICS0078_IMAGE_HEIGHT;
@@ -932,7 +1050,7 @@ diag_image (FpiDeviceSynaptics0078 *self,
   g_autofree gchar *comment = NULL;
   g_autofree gchar *diff_text = NULL;
   gint64 now_us = g_get_monotonic_time ();
-  gdouble sum = 0, sq = 0, mean, sd, grad = 0, diff = 0;
+  gdouble sum = 0, sq = 0, mean, sd, grad = 0;
   guint grad_n = 0, blocks = 0, covered = 0;
   gint x, y, bx, by;
   gsize i;
@@ -988,11 +1106,9 @@ diag_image (FpiDeviceSynaptics0078 *self,
           covered++;
       }
 
-  if (self->diag_last_capture)
+  if (self->last_capture)
     {
-      for (i = 0; i < n_pixels; i++)
-        diff += ABS (px[i] - self->diag_last_capture[i]);
-      diff_text = g_strdup_printf ("%.1f", diff / n_pixels);
+      diff_text = g_strdup_printf ("%.1f", image_diff (px, self->last_capture));
     }
   else
     {
@@ -1020,12 +1136,6 @@ diag_image (FpiDeviceSynaptics0078 *self,
                              read_u16le (reply, 8), read_u16le (reply, 10),
                              read_u16le (reply, 12), read_u32le (reply, 14));
   diag_write_pgm (self, name, comment, px);
-
-  if (delivered)
-    {
-      g_free (self->diag_last_capture);
-      self->diag_last_capture = g_memdup2 (px, n_pixels);
-    }
 }
 
 /* ======================= Open / close ====================== */
@@ -1460,7 +1570,8 @@ dev_deactivate (FpImageDevice *dev)
 
   if (self->ssm)
     {
-      /* A pending pause between finger-off probes: end it now. */
+      /* A pending pause between finger-off probes (of a finger-off run or
+       * of a capture's same-touch wait): end it now. */
       if (self->pause_pending)
         {
           self->pause_pending = FALSE;
@@ -1744,13 +1855,63 @@ submit_interrupt (FpiDeviceSynaptics0078 *self,
                            capture_interrupt_cb, NULL);
 }
 
-/* Finger-off window ended without a finger event: leave the sensor armed. */
+/* Logs the end of finger-off probing (L1/L2 of the a5b log contract). */
+static void
+log_finger_off (FpiDeviceSynaptics0078 *self)
+{
+  gint64 elapsed_ms = (g_get_monotonic_time () - self->probe_start_us) /
+                      G_TIME_SPAN_MILLISECOND;
+
+  if (self->new_touch)
+    fp_info ("Finger off after %u probe(s), %" G_GINT64_FORMAT " ms: "
+             "new touch (diff %.1f >= %d)",
+             self->probe_count, elapsed_ms, self->new_touch_diff,
+             SYNAPTICS0078_NEW_TOUCH_DIFF);
+  else
+    fp_info ("Finger off after %u probe(s), %" G_GINT64_FORMAT " ms: "
+             "no finger event",
+             self->probe_count, elapsed_ms);
+}
+
+/* Starts (re)counting a probing run: a finger-off run or a guard wait. */
+static void
+probe_reset (FpiDeviceSynaptics0078 *self)
+{
+  self->probing = TRUE;
+  self->probe_count = 0;
+  self->probe_start_us = g_get_monotonic_time ();
+  self->probe_slow_logged = FALSE;
+  self->new_touch = FALSE;
+  self->new_touch_diff = 0;
+}
+
+/*
+ * Finger-off probing found the finger off: no finger event in the window
+ * (the sensor is left armed) or, in a finger-off run, a new touch (already
+ * disarmed). A finger-off run ends and capture_complete() reports it. A
+ * capture's guard wait only gets here without a finger event (a new touch
+ * there is the capture, see handle_image_reply()): the driver saw the lift,
+ * so the next touch is taken without the guard (see the top of the file)
+ * and CAPTURE_ARM_SEND listens on the armed sensor.
+ */
 static void
 probe_finger_off (FpiDeviceSynaptics0078 *self,
                   FpiSsm                 *ssm)
 {
-  self->finger_off = TRUE;
-  fpi_ssm_mark_completed (ssm);
+  if (self->finger_off_run)
+    {
+      self->finger_off = TRUE;
+      fpi_ssm_mark_completed (ssm);
+      return;
+    }
+
+  log_finger_off (self);
+  fp_info ("Lift seen during the guard wait, accepting the next touch "
+           "without the same-touch check");
+  self->probing = FALSE;
+  self->new_touch = FALSE;
+  self->guard_bypass = TRUE;
+  fpi_ssm_jump_to_state (ssm, CAPTURE_ARM_SEND);
 }
 
 /* No image-ready event within SYNAPTICS0078_READY_TIMEOUT of the finger. */
@@ -1840,15 +2001,11 @@ capture_interrupt_cb (FpiUsbTransfer *transfer, FpDevice *dev,
     {
       if (action == EVENT_FINGER)
         {
+          /* A capture reports the finger only in capture_complete(): the
+           * same-touch guard may still discard this touch, and the core
+           * expects an image once the finger is reported. */
           if (self->probing)
-            {
-              fp_dbg ("Finger-off probe %u: finger still down", self->probe_count);
-            }
-          else
-            {
-              self->finger_reported = TRUE;
-              fpi_image_device_report_finger_status (FP_IMAGE_DEVICE (dev), TRUE);
-            }
+            fp_dbg ("Finger-off probe %u: finger still down", self->probe_count);
 
           self->ready_deadline_us = g_get_monotonic_time () +
                                     SYNAPTICS0078_READY_TIMEOUT * G_TIME_SPAN_MILLISECOND;
@@ -1922,6 +2079,26 @@ handle_arm_reply (FpiDeviceSynaptics0078 *self,
   fpi_ssm_next_state (transfer->ssm);
 }
 
+/*
+ * Keeps @pixels as the image to hand to the core and ends the run; @diff is
+ * the difference to the reference (< 0: none) for the log.
+ */
+static void
+take_capture (FpiDeviceSynaptics0078 *self,
+              FpiSsm                 *ssm,
+              const guint8           *pixels,
+              gdouble                 diff)
+{
+  g_clear_object (&self->capture_image);
+  g_clear_pointer (&self->capture_pixels, g_free);
+  self->capture_image = build_image (pixels);
+  self->capture_pixels = g_memdup2 (pixels, SYNAPTICS0078_IMAGE_WIDTH *
+                                    SYNAPTICS0078_IMAGE_HEIGHT);
+  self->capture_diff = diff;
+  self->outcome = OUTCOME_IMAGE;
+  fpi_ssm_mark_completed (ssm);
+}
+
 static void
 handle_image_reply (FpiDeviceSynaptics0078 *self,
                     FpiUsbTransfer         *transfer,
@@ -1931,6 +2108,7 @@ handle_image_reply (FpiDeviceSynaptics0078 *self,
   g_autoptr(GError) reply_error = NULL;
   const guint8 *pixels = NULL;
   enum image_reply kind;
+  gdouble diff = -1; /* vs the reference; < 0: no image or no reference */
 
   if (error)
     {
@@ -1950,7 +2128,7 @@ handle_image_reply (FpiDeviceSynaptics0078 *self,
 
   self->image_replies++;
   kind = parse_image_reply (transfer, &pixels, &reply_error);
-  diag_image (self, transfer, !self->probing && kind == IMAGE_REPLY_IMAGE);
+  diag_image (self, transfer);
 
   if (kind == IMAGE_REPLY_NOT_READY &&
       self->image_replies < SYNAPTICS0078_IMAGE_MAX_REPLIES)
@@ -1961,10 +2139,48 @@ handle_image_reply (FpiDeviceSynaptics0078 *self,
       return;
     }
 
+  /* A stale reference (a retry since it was captured) is not used: see
+   * the top of the file. */
+  if (kind == IMAGE_REPLY_IMAGE && self->last_capture && !self->reference_stale)
+    diff = image_diff (pixels, self->last_capture);
+
   if (self->probing)
     {
-      fp_dbg ("Finger-off probe %u: discarding the 51 reply (%s)",
-              self->probe_count, image_reply_names[kind]);
+      if (diff >= 0 && is_new_touch (diff, SYNAPTICS0078_NEW_TOUCH_DIFF))
+        {
+          /* In the guard's wait the new touch is the capture itself;
+           * CLEANUP ends it with 04/52 as for any capture. */
+          if (!self->finger_off_run)
+            {
+              fp_dbg ("Finger-off probe %u: new touch (diff %.1f >= %d), "
+                      "taking this image as the capture",
+                      self->probe_count, diff, SYNAPTICS0078_NEW_TOUCH_DIFF);
+              take_capture (self, ssm, pixels, diff);
+              return;
+            }
+
+          /* CAPTURE_DISARM next; CAPTURE_PAUSE then sees self->new_touch. */
+          self->new_touch = TRUE;
+          self->new_touch_diff = diff;
+        }
+      else if (diff >= 0)
+        {
+          fp_dbg ("Finger-off probe %u: same touch (diff %.1f < %d)",
+                  self->probe_count, diff, SYNAPTICS0078_NEW_TOUCH_DIFF);
+        }
+      else if (kind == IMAGE_REPLY_IMAGE && self->last_capture)
+        {
+          /* Stale reference: the finger event alone says still down. */
+          fp_dbg ("Finger-off probe %u: reference image is stale (a retry "
+                  "since), image not compared",
+                  self->probe_count);
+        }
+      else
+        {
+          /* No pixels or no reference: inconclusive, still down. */
+          fp_dbg ("Finger-off probe %u: discarding the 51 reply (%s)",
+                  self->probe_count, image_reply_names[kind]);
+        }
       fpi_ssm_next_state (ssm);
       return;
     }
@@ -1972,10 +2188,26 @@ handle_image_reply (FpiDeviceSynaptics0078 *self,
   switch (kind)
     {
     case IMAGE_REPLY_IMAGE:
-      g_clear_object (&self->capture_image);
-      self->capture_image = build_image (pixels);
-      self->outcome = OUTCOME_IMAGE;
-      fpi_ssm_mark_completed (ssm);
+      if (self->guard_bypass)
+        {
+          fp_dbg ("Same-touch check skipped: the lift was seen during the guard wait");
+        }
+      else if (diff >= 0 && !is_new_touch (diff, SYNAPTICS0078_NEW_TOUCH_DIFF))
+        {
+          /* Not handed to the core and not the new reference. */
+          fp_info ("Same touch as the last capture (diff %.1f < %d), not submitted; "
+                   "waiting for finger off",
+                   diff, SYNAPTICS0078_NEW_TOUCH_DIFF);
+          probe_reset (self);
+          fpi_ssm_jump_to_state (ssm, CAPTURE_DISARM);
+          return;
+        }
+      else if (self->last_capture && self->reference_stale)
+        {
+          fp_dbg ("Same-touch check skipped: the reference image is stale (a retry since)");
+        }
+
+      take_capture (self, ssm, pixels, diff);
       return;
 
     case IMAGE_REPLY_CAPTURE_ERROR:
@@ -2031,7 +2263,8 @@ capture_run_state (FpiSsm *ssm, FpDevice *dev)
 {
   FpiDeviceSynaptics0078 *self = FPI_DEVICE_SYNAPTICS0078 (dev);
   gint state = fpi_ssm_get_cur_state (ssm);
-  guint remaining;
+  guint remaining, pause_ms;
+  gint64 elapsed_ms;
 
   /* Entering any state means no delayed state change is pending. */
   self->pause_pending = FALSE;
@@ -2055,7 +2288,8 @@ capture_run_state (FpiSsm *ssm, FpDevice *dev)
         }
       if (self->armed)
         {
-          /* Left armed by the finger-off probe: just listen. (Probing
+          /* Left armed by a finger-off probe (of the previous finger-off
+           * run or of this capture's guard wait): just listen. (Probing
            * always starts disarmed; the window is set for completeness.) */
           fp_dbg ("Sensor already armed, listening on EP 0x%02x",
                   SYNAPTICS0078_EP_INT);
@@ -2112,14 +2346,31 @@ capture_run_state (FpiSsm *ssm, FpDevice *dev)
       break;
 
     case CAPTURE_DISARM:
-      /* Finger still down (or inconclusive): end this capture. */
+      /* A probe saw a finger (or was inconclusive), or the guard discarded
+       * a same-touch capture: end this capture. */
       fpi_ssm_start_subsm (ssm, disarm_ssm_new (dev));
       break;
 
     case CAPTURE_PAUSE:
+      /* A new touch means the finger was lifted: no pause. */
+      if (self->new_touch)
+        {
+          probe_finger_off (self, ssm);
+          break;
+        }
+
+      elapsed_ms = (g_get_monotonic_time () - self->probe_start_us) /
+                   G_TIME_SPAN_MILLISECOND;
+      pause_ms = probe_pause_ms (elapsed_ms, self->probe_backoff_ms);
+      if (elapsed_ms >= SYNAPTICS0078_PROBE_SLOW_AFTER_MS && !self->probe_slow_logged)
+        {
+          self->probe_slow_logged = TRUE;
+          fp_info ("Finger still down for %u s, probing every %u ms from now on",
+                   (guint) (elapsed_ms / 1000), pause_ms);
+        }
+
       self->pause_pending = TRUE;
-      fpi_ssm_jump_to_state_delayed (ssm, CAPTURE_ARM_SEND,
-                                     self->probe_backoff_ms);
+      fpi_ssm_jump_to_state_delayed (ssm, CAPTURE_ARM_SEND, pause_ms);
       break;
 
     case CAPTURE_CLEANUP:
@@ -2146,7 +2397,8 @@ capture_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
   FpiDeviceSynaptics0078 *self = FPI_DEVICE_SYNAPTICS0078 (dev);
   FpImageDevice *idev = FP_IMAGE_DEVICE (dev);
   g_autoptr(FpImage) image = g_steal_pointer (&self->capture_image);
-  gint64 elapsed_ms;
+  g_autofree guint8 *pixels = g_steal_pointer (&self->capture_pixels);
+  g_autofree gchar *diff_text = NULL;
 
   self->ssm = NULL;
   self->pause_pending = FALSE;
@@ -2163,7 +2415,8 @@ capture_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
       return;
     }
 
-  if (self->probing)
+  /* Not self->probing: a capture run probes too during a guard wait. */
+  if (self->finger_off_run)
     {
       if (!self->finger_off)
         {
@@ -2173,27 +2426,33 @@ capture_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
           return;
         }
 
-      elapsed_ms = (g_get_monotonic_time () - self->probe_start_us) /
-                   G_TIME_SPAN_MILLISECOND;
-      fp_info ("Finger off after %u probe(s), %" G_GINT64_FORMAT " ms",
-               self->probe_count, elapsed_ms);
+      log_finger_off (self);
       fpi_image_device_report_finger_status (idev, FALSE);
       return;
     }
 
+  /* The finger is reported only now, right before the image or the retry:
+   * the core moves from AWAIT_FINGER_ON to CAPTURE on the report and expects
+   * one of the two there (in enroll a retry moves on to AWAIT_FINGER_OFF). */
   switch (self->outcome)
     {
     case OUTCOME_IMAGE:
-      fp_dbg ("Image captured");
+      /* The image handed to the core becomes the reference. */
+      diff_text = self->capture_diff >= 0 ?
+                  g_strdup_printf ("%.1f", self->capture_diff) : g_strdup ("-");
+      g_free (self->last_capture);
+      self->last_capture = g_steal_pointer (&pixels);
+      self->reference_stale = FALSE;
+      fp_dbg ("Image captured (diff vs last capture %s)", diff_text);
+      fpi_image_device_report_finger_status (idev, TRUE);
       fpi_image_device_image_captured (idev, g_steal_pointer (&image));
       break;
 
     case OUTCOME_RETRY:
-      /* The core expects a retry in CAPTURE state (in enroll it moves on to
-       * AWAIT_FINGER_OFF), so a failure before the finger event reports the
-       * finger first. */
-      if (!self->finger_reported)
-        fpi_image_device_report_finger_status (idev, TRUE);
+      /* A touch the core does not get: the reference is now older than the
+       * finger on the sensor (see the top of the file). */
+      self->reference_stale = TRUE;
+      fpi_image_device_report_finger_status (idev, TRUE);
       fpi_image_device_retry_scan (idev, FP_DEVICE_RETRY_GENERAL);
       break;
 
@@ -2216,19 +2475,20 @@ start_capture (FpiDeviceSynaptics0078 *self,
       return;
     }
 
-  self->probing = probing;
+  self->finger_off_run = probing;
+  self->probing = FALSE;
   self->outcome = OUTCOME_NONE;
-  self->finger_reported = FALSE;
   self->finger_off = FALSE;
   self->image_replies = 0;
   self->image_reread = FALSE;
+  self->capture_diff = -1;
+  self->new_touch = FALSE;
+  self->guard_bypass = FALSE;
   g_clear_object (&self->capture_image);
+  g_clear_pointer (&self->capture_pixels, g_free);
 
   if (probing)
-    {
-      self->probe_count = 0;
-      self->probe_start_us = g_get_monotonic_time ();
-    }
+    probe_reset (self);
 
   self->ssm = fpi_ssm_new_full (FP_DEVICE (self), capture_run_state,
                                 CAPTURE_NUM_STATES, CAPTURE_CLEANUP,
@@ -2283,6 +2543,8 @@ fpi_device_synaptics0078_finalize (GObject *object)
   /* Normally freed by img_close already. */
   clear_session_data (self);
   clear_capture_data (self);
+  /* Kept across close/open, see the top of the file. */
+  g_clear_pointer (&self->last_capture, g_free);
 
   G_OBJECT_CLASS (fpi_device_synaptics0078_parent_class)->finalize (object);
 }
@@ -2303,6 +2565,18 @@ fpi_device_synaptics0078_class_init (FpiDeviceSynaptics0078Class *klass)
   dev_class->scan_type = FP_SCAN_TYPE_PRESS;
   dev_class->nr_enroll_stages = SYNAPTICS0078_ENROLL_STAGES;
 
+  /*
+   * No temperature model, as the MOC drivers (synaptics, goodixmoc, elanmoc,
+   * ...): under Windows the sensor idles armed indefinitely, waiting on its
+   * own interrupt without polling; the 18-stage enroll plus fprintd's
+   * duplicate-check identify does not fit the default 180 s budget (it went
+   * HOT at 180.9 s on 2026-10-15); and the one continuous-imaging part,
+   * finger-off probing, is bounded by SYNAPTICS0078_PROBE_SLOW_BACKOFF_MS.
+   * FpImageDevice computed the inherited features before this class set
+   * temp_hot_seconds, so they are computed again at the end (ALWAYS_ON).
+   */
+  dev_class->temp_hot_seconds = -1;
+
   img_class->img_width = SYNAPTICS0078_IMAGE_WIDTH * SYNAPTICS0078_UPSCALE;
   img_class->img_height = SYNAPTICS0078_IMAGE_HEIGHT * SYNAPTICS0078_UPSCALE;
   img_class->algorithm = FPI_DEVICE_ALGO_SIGFM;
@@ -2313,4 +2587,6 @@ fpi_device_synaptics0078_class_init (FpiDeviceSynaptics0078Class *klass)
   img_class->activate = dev_activate;
   img_class->deactivate = dev_deactivate;
   img_class->change_state = dev_change_state;
+
+  fpi_device_class_auto_initialize_features (dev_class);
 }
