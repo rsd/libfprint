@@ -131,6 +131,13 @@
  *                                      it at a private, untracked directory.
  *   FP_SYNAPTICS0078_PROBE_WINDOW_MS   finger-off probe window, 50..10000
  *   FP_SYNAPTICS0078_PROBE_BACKOFF_MS  pause between finger-off probes, 0..60000
+ *
+ * Tests: tests/synaptics0078 replays a USB session that its generate.py
+ * synthesizes (nothing is recorded from a sensor) with a synthetic module.bin
+ * and program. That module's sha256, SYNAPTICS0078_TEST_MODULE_SHA256, is
+ * accepted only in emulation mode (FP_DEVICE_EMULATION=1 and the test
+ * emulation library loaded); otherwise SYNAPTICS0078_MODULE_SHA256 is the only
+ * accepted module, which the synaptics0078-hwpin test checks.
  */
 
 #define FP_COMPONENT "synaptics0078"
@@ -228,6 +235,11 @@
 #define SYNAPTICS0078_MODULE_SIZE 10500
 #define SYNAPTICS0078_MODULE_SHA256 \
   "67f4a332d89f76fe12c57fa7f67b43a076f689e78267b888c694e26b05caacc1"
+/* The synthetic data/module.bin of tests/synaptics0078 (see the top of the
+ * file); accepted in emulation mode only. generate.py --check keeps the two
+ * in step. */
+#define SYNAPTICS0078_TEST_MODULE_SHA256 \
+  "40af1d1f3ab38641db4fda7eff236d6b5be5c38129a3b53351f96864030a681d"
 #define SYNAPTICS0078_PROGRAM_SIZE 18869
 
 #define CMD_ROM_INFO 0x01
@@ -837,6 +849,19 @@ read_data_file (const gchar *path,
   return g_bytes_new_take (contents, length);
 }
 
+/* The replay test's synthetic module, and only in emulation mode. */
+static gboolean
+is_test_module (FpiDeviceSynaptics0078 *self,
+                const gchar            *checksum)
+{
+  if (g_strcmp0 (checksum, SYNAPTICS0078_TEST_MODULE_SHA256) != 0 ||
+      !fpi_device_emulation_mode_enabled (FP_DEVICE (self)))
+    return FALSE;
+
+  fp_info ("Capture module: the synthetic test module (emulation mode)");
+  return TRUE;
+}
+
 static gboolean
 load_data_files (FpiDeviceSynaptics0078 *self,
                  GError                **error)
@@ -868,7 +893,8 @@ load_data_files (FpiDeviceSynaptics0078 *self,
     }
 
   checksum = g_compute_checksum_for_data (G_CHECKSUM_SHA256, data, size);
-  if (g_strcmp0 (checksum, SYNAPTICS0078_MODULE_SHA256) != 0)
+  if (g_strcmp0 (checksum, SYNAPTICS0078_MODULE_SHA256) != 0 &&
+      !is_test_module (self, checksum))
     {
       g_set_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_DATA_INVALID,
                    "%s has sha256 %s, expected %s",

@@ -64,6 +64,7 @@ drivers_tests = {
     'focaltech_moc-6553': {},
     'mafpmoc': {},
     'secugen': {},
+    'synaptics0078': { 'timeout': 60 },
 }
 
 if get_option('introspection')
@@ -298,6 +299,32 @@ if get_option('introspection')
         endif
     endforeach
 
+    # synaptics0078's replay is synthesized by its generate.py; the hwpin test
+    # checks that outside emulation mode the synthetic module is refused.  (The
+    # fixture test, which needs none of this, is registered below.)
+    if ('synaptics0078' in supported_drivers and
+        gusb_dep.version().version_compare('>= 0.3.0'))
+        synaptics0078_envs = envs
+        synaptics0078_envs.set('FP_DRIVERS_ALLOWLIST', 'synaptics0078')
+
+        test('synaptics0078-hwpin',
+            python3,
+            args: [files('synaptics0078' / 'hwpin.py')],
+            env: synaptics0078_envs,
+            suite: ['drivers', 'custom'],
+            timeout: 30,
+            depends: [
+                libfprint_typelib,
+                test_emulation_lib,
+            ],
+        )
+    else
+        test('synaptics0078-hwpin',
+            sh,
+            args: ['-c', 'exit 77']
+        )
+    endif
+
     if  installed_tests and driver_tests_enabled
         install_data(umockdev_test.full_path(),
             install_dir: installed_tests_execdir,
@@ -321,6 +348,22 @@ else
             args: ['-c', 'exit 77']
         )
     endforeach
+
+    test('synaptics0078-hwpin',
+        sh,
+        args: ['-c', 'exit 77']
+    )
+endif
+
+# The fixture test checks that the committed synaptics0078 replay files are
+# generate.py's output and that the driver pins the synthetic module.  It needs
+# only python3, so it runs with or without introspection, OpenCV or GUsb.
+if fs.exists(meson.current_source_dir() / 'synaptics0078' / 'generate.py')
+    test('synaptics0078-fixture',
+        python3,
+        args: [files('synaptics0078' / 'generate.py'), '--check'],
+        suite: ['drivers'],
+    )
 endif
 
 test_utils = static_library('fprint-test-utils',
