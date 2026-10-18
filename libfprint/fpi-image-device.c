@@ -76,7 +76,14 @@ fpi_image_device_deactivate (FpImageDevice *self, gboolean cancelling)
       fp_dbg ("Already deactivated, ignoring request.");
       return;
     }
-  if (!cancelling && priv->state != FPI_IMAGE_DEVICE_STATE_IDLE)
+  /* The last enroll stage deactivates as soon as minutiae detection is done,
+   * which can be before the driver reports finger off: a press sensor that
+   * needs a probe window to see the lift is still in AWAIT_FINGER_OFF then.
+   * That is expected, not a driver bug. */
+  if (!cancelling && priv->state != FPI_IMAGE_DEVICE_STATE_IDLE &&
+      !(priv->state == FPI_IMAGE_DEVICE_STATE_AWAIT_FINGER_OFF &&
+        fpi_device_get_current_action (device) == FPI_DEVICE_ACTION_ENROLL &&
+        priv->enroll_stage == fp_device_get_nr_enroll_stages (device)))
     g_warning ("Deactivating image device while it is not idle, this should not happen.");
 
   fp_dbg ("Deactivating image device");
